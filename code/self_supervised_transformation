@@ -1,0 +1,586 @@
+"""
+Self-supervised ECG transformations for representation learning
+===============================================================
+
+Implements the ECG transformations:
+
+1. Noise addition
+2. Scaling
+3. Temporal inversion
+4. Permutation
+5. Negation
+6. Time-warping
+
+
+Expected ECG input format:
+--------------------------
+Single signal:
+    ecg.shape == (T,)
+
+Batch of signals:
+    ecg_batch.shape == (N, T)
+
+All signals are assumed to be 1D ECG segments of fixed length.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+import torch
+from torch.utils.data import Dataset
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+set_seed(42)
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+@dataclass
+class TransformationConfig:
+    # Noise addition
+    snr_min: float = 2.0
+    snr_max: float = 45.0
+
+    # Scaling
+    scale_min: float = 0.1
+    scale_max: float = 10.0
+
+    # Permutation / time-warping
+    segments_min: int = 2
+    segments_max: int = 40
+
+    # Time-warping
+    stretch_min: float = 1.05
+    stretch_max: float = 4.0
+
+    # Safety
+    min_segment_length: int = 4
+
+
+CFG = TransformationConfig()
+
+
+# ============================================================
+# Transformation names and labels
+# ============================================================
+
+TRANSFORMATION_LABELS = {
+    "original": 0,
+    "noise_addition": 1,
+    "scaling": 2,
+    "temporal_inversion": 3,
+    "permutation": 4,
+    "negation": 5,
+    "time_warping": 6,
+}
+
+LABEL_TO_TRANSFORMATION = {v: k for k, v in TRANSFORMATION_LABELS.items()}
+
+
+# ============================================================
+# Core utilities
+# ============================================================
+
+def signal_power(x: np.ndarray) -> float:
+    """
+    Average signal power E_avg = mean(x^2)
+    """
+    return float(np.mean(np.square(x)))
+
+
+def resample_to_length(x: np.ndarray, target_length: int) -> np.ndarray:
+    """
+    Resample a 1D signal to the desired length using linear interpolation.
+    """
+    if len(x) == target_length:
+        return x.astype(np.float32)
+
+    old_idx = np.linspace(0, 1, num=len(x))
+    new_idx = np.linspace(0, 1, num=target_length)
+    f = interp1d(old_idx, x, kind="linear", fill_value="extrapolate")
+    return f(new_idx).astype(np.float32)
+
+
+def split_signal_into_segments(x: np.ndarray, m: int) -> List[np.ndarray]:
+    """
+    Split a signal into m approximately equal contiguous segments.
+    """
+    indices = np.array_split(np.arange(len(x)), m)
+    segments = [x[idx] for idx in indices if len(idx) > 0]
+    return segments
+
+
+def valid_num_segments(length: int, requested_m: int, min_segment_length: int = 4) -> int:
+    """
+    Restrict number of segments to ensure each segment has at least min_segment_length samples.
+    """
+    max_allowed = max(2, length // min_segment_length)
+    return int(max(2, min(requested_m, max_allowed)))
+
+
+# ============================================================
+# 5.1.1 Noise addition
+# ============================================================
+
+def add_gaussian_noise_snr(x: np.ndarray, snr_db: float) -> np.ndarray:
+    """
+    Add zero-mean Gaussian noise based on signal power and target SNR.
+
+    
+    E_Navg = 10^((E_Eavg - alpha)/10)
+
+    In practical DSP implementations, SNR is usually handled in dB as:
+        noise_power = signal_power / (10^(snr_db/10))
+
+    This implementation follows the standard SNR definition.
+    """
+    p_signal = signal_power(x)
+    if p_signal <= 1e-12:
+        return x.copy().astype(np.float32)
+
+    p_noise = p_signal / (10 ** (snr_db / 10.0))
+    noise_std = np.sqrt(p_noise)
+
+    noise = np.random.normal(loc=0.0, scale=noise_std, size=x.shape)
+    return (x + noise).astype(np.float32)
+
+
+# ============================================================
+# 5.1.2 Scaling
+# ============================================================
+
+def scale_signal(x: np.ndarray, factor: float) -> np.ndarray:
+    """
+    Scale ECG amplitude by a positive constant factor.
+    """
+    return (factor * x).astype(np.float32)
+
+
+# ============================================================
+# 5.1.3 Temporal inversion
+# ============================================================
+
+def temporal_inversion(x: np.ndarray) -> np.ndarray:
+    """
+    Reverse the ECG signal in time.
+    """
+    return x[::-1].copy().astype(np.float32)
+
+
+# ============================================================
+# 5.1.3 Permutation
+# ============================================================
+
+def permute_signal(x: np.ndarray, num_segments: int) -> np.ndarray:
+    """
+    Divide signal into m contiguous parts and randomly reorder them.
+    Preserves local structure while disrupting global temporal order.
+    """
+    m = valid_num_segments(len(x), num_segments, CFG.min_segment_length)
+    segments = split_signal_into_segments(x, m)
+
+    order = np.random.permutation(len(segments))
+    permuted = np.concatenate([segments[i] for i in order], axis=0)
+
+    return permuted.astype(np.float32)
+
+
+# ============================================================
+# 5.1.4 Negation
+# ============================================================
+
+def negate_signal(x: np.ndarray) -> np.ndarray:
+    """
+    Invert ECG polarity.
+    """
+    return (-x).astype(np.float32)
+
+
+# ============================================================
+# 5.1.5 Time-warping
+# ============================================================
+
+def stretch_or_compress_segment(segment: np.ndarray, factor: float) -> np.ndarray:
+    """
+    factor > 1.0  -> stretch
+    factor < 1.0  -> compress
+    """
+    new_len = max(2, int(round(len(segment) * factor)))
+    return resample_to_length(segment, new_len)
+
+
+def time_warp_signal(
+    x: np.ndarray,
+    num_segments: int,
+    stretch_factor: float,
+) -> np.ndarray:
+    """
+    Divide ECG into m windows.
+    Randomly stretch some segments and compress others.
+    Then normalize the full signal length back to original via interpolation.
+
+    Here, length normalization is done by final resampling back to original length.
+    """
+    m = valid_num_segments(len(x), num_segments, CFG.min_segment_length)
+    segments = split_signal_into_segments(x, m)
+
+    warped_segments = []
+    for seg in segments:
+        if len(seg) < 2:
+            warped_segments.append(seg)
+            continue
+
+        # randomly stretch or compress
+        if np.random.rand() < 0.5:
+            factor = stretch_factor
+        else:
+            factor = 1.0 / stretch_factor
+
+        warped_seg = stretch_or_compress_segment(seg, factor)
+        warped_segments.append(warped_seg)
+
+    warped = np.concatenate(warped_segments, axis=0)
+
+    # restore original signal length
+    warped = resample_to_length(warped, len(x))
+    return warped.astype(np.float32)
+
+
+# ============================================================
+# Parameter sampling
+# ============================================================
+
+def sample_noise_params(cfg: TransformationConfig = CFG) -> Dict:
+    snr_db = np.random.uniform(cfg.snr_min, cfg.snr_max)
+    return {"snr_db": float(snr_db)}
+
+
+def sample_scaling_params(cfg: TransformationConfig = CFG) -> Dict:
+    factor = np.random.uniform(cfg.scale_min, cfg.scale_max)
+    return {"factor": float(factor)}
+
+
+def sample_permutation_params(signal_length: int, cfg: TransformationConfig = CFG) -> Dict:
+    m = np.random.randint(cfg.segments_min, cfg.segments_max + 1)
+    m = valid_num_segments(signal_length, m, cfg.min_segment_length)
+    return {"num_segments": int(m)}
+
+
+def sample_time_warp_params(signal_length: int, cfg: TransformationConfig = CFG) -> Dict:
+    m = np.random.randint(cfg.segments_min, cfg.segments_max + 1)
+    m = valid_num_segments(signal_length, m, cfg.min_segment_length)
+    stretch_factor = np.random.uniform(cfg.stretch_min, cfg.stretch_max)
+    return {
+        "num_segments": int(m),
+        "stretch_factor": float(stretch_factor),
+    }
+
+
+# ============================================================
+# Unified transformation API
+# ============================================================
+
+def apply_transformation(
+    x: np.ndarray,
+    transformation_name: str,
+    params: Optional[Dict] = None,
+    cfg: TransformationConfig = CFG,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Apply a specified ECG transformation.
+
+    Returns:
+        transformed_signal, used_params
+    """
+    x = np.asarray(x, dtype=np.float32).copy()
+
+    if transformation_name == "original":
+        return x, {}
+
+    if transformation_name == "noise_addition":
+        if params is None:
+            params = sample_noise_params(cfg)
+        y = add_gaussian_noise_snr(x, snr_db=params["snr_db"])
+        return y, params
+
+    if transformation_name == "scaling":
+        if params is None:
+            params = sample_scaling_params(cfg)
+        y = scale_signal(x, factor=params["factor"])
+        return y, params
+
+    if transformation_name == "temporal_inversion":
+        y = temporal_inversion(x)
+        return y, {}
+
+    if transformation_name == "permutation":
+        if params is None:
+            params = sample_permutation_params(len(x), cfg)
+        y = permute_signal(x, num_segments=params["num_segments"])
+        return y, params
+
+    if transformation_name == "negation":
+        y = negate_signal(x)
+        return y, {}
+
+    if transformation_name == "time_warping":
+        if params is None:
+            params = sample_time_warp_params(len(x), cfg)
+        y = time_warp_signal(
+            x,
+            num_segments=params["num_segments"],
+            stretch_factor=params["stretch_factor"],
+        )
+        return y, params
+
+    raise ValueError(f"Unknown transformation: {transformation_name}")
+
+
+def sample_random_transformation(include_original: bool = False) -> str:
+    names = list(TRANSFORMATION_LABELS.keys())
+    if not include_original:
+        names = [n for n in names if n != "original"]
+    return random.choice(names)
+
+
+# ============================================================
+# Self-supervised dataset
+# ============================================================
+
+class ECGTransformationDataset(Dataset):
+    """
+    Self-supervised dataset for transformation recognition.
+
+    For each input ECG segment:
+    - randomly choose one transformation
+    - apply it
+    - return transformed ECG and transformation label
+
+    Output:
+        transformed_ecg : torch.FloatTensor of shape (1, T)
+        label           : torch.LongTensor scalar
+        metadata        : dict
+    """
+
+    def __init__(
+        self,
+        ecg_signals: np.ndarray,
+        cfg: TransformationConfig = CFG,
+        include_original_class: bool = False,
+        return_original: bool = False,
+    ):
+        """
+        ecg_signals: np.ndarray of shape (N, T)
+        """
+        assert ecg_signals.ndim == 2, f"Expected (N, T), got {ecg_signals.shape}"
+
+        self.ecg_signals = ecg_signals.astype(np.float32)
+        self.cfg = cfg
+        self.include_original_class = include_original_class
+        self.return_original = return_original
+
+        self.available_transformations = list(TRANSFORMATION_LABELS.keys())
+        if not include_original_class:
+            self.available_transformations = [
+                t for t in self.available_transformations if t != "original"
+            ]
+
+    def __len__(self) -> int:
+        return len(self.ecg_signals)
+
+    def __getitem__(self, idx: int):
+        x = self.ecg_signals[idx]
+        transformation_name = random.choice(self.available_transformations)
+
+        transformed, params = apply_transformation(
+            x,
+            transformation_name=transformation_name,
+            params=None,
+            cfg=self.cfg,
+        )
+
+        label = TRANSFORMATION_LABELS[transformation_name]
+
+        transformed_tensor = torch.tensor(transformed, dtype=torch.float32).unsqueeze(0)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
+        metadata = {
+            "index": idx,
+            "transformation_name": transformation_name,
+            "params": params,
+        }
+
+        if self.return_original:
+            original_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
+            return original_tensor, transformed_tensor, label_tensor, metadata
+
+        return transformed_tensor, label_tensor, metadata
+
+
+# ============================================================
+# Optional balanced multi-view generator
+# ============================================================
+
+def generate_all_transformations_for_signal(
+    x: np.ndarray,
+    include_original: bool = True,
+    cfg: TransformationConfig = CFG,
+) -> List[Dict]:
+    """
+    Generate one transformed version for each transformation class.
+    Useful for visualization or offline dataset creation.
+    """
+    outputs = []
+    transformation_names = list(TRANSFORMATION_LABELS.keys())
+
+    if not include_original:
+        transformation_names = [t for t in transformation_names if t != "original"]
+
+    for name in transformation_names:
+        y, params = apply_transformation(x, name, params=None, cfg=cfg)
+        outputs.append({
+            "transformation_name": name,
+            "label": TRANSFORMATION_LABELS[name],
+            "signal": y,
+            "params": params,
+        })
+
+    return outputs
+
+
+# ============================================================
+# Plotting utilities
+# ============================================================
+
+def plot_transformations(
+    x: np.ndarray,
+    fs: Optional[float] = None,
+    include_original: bool = True,
+    cfg: TransformationConfig = CFG,
+    figsize: Tuple[int, int] = (14, 12),
+):
+    """
+    Plot one example of each transformation for a given ECG signal.
+    """
+    examples = generate_all_transformations_for_signal(
+        x,
+        include_original=include_original,
+        cfg=cfg,
+    )
+
+    n = len(examples)
+    cols = 2
+    rows = int(np.ceil(n / cols))
+
+    if fs is None:
+        t = np.arange(len(x))
+        xlabel = "Samples"
+    else:
+        t = np.arange(len(x)) / fs
+        xlabel = "Time (s)"
+
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    axes = np.array(axes).reshape(-1)
+
+    for ax, ex in zip(axes, examples):
+        ax.plot(t, ex["signal"], linewidth=1.2)
+        title = ex["transformation_name"]
+        if ex["params"]:
+            title += f"\n{ex['params']}"
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes[len(examples):]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# Example usage
+# ============================================================
+
+def create_synthetic_ecg_batch(n_samples: int = 8, length: int = 3000, fs: float = 100.0) -> np.ndarray:
+    """
+    Creates synthetic ECG-like signals for demonstration only.
+    Replace with real ECG segments in practice.
+    """
+    batch = []
+    t = np.arange(length) / fs
+
+    for _ in range(n_samples):
+        x = 0.02 * np.sin(2 * np.pi * 0.3 * t)  # slow baseline
+
+        rr = np.random.uniform(0.7, 1.0)
+        peaks = np.arange(0.5, length / fs, rr)
+
+        for pt in peaks:
+            c = int(pt * fs)
+            if 3 <= c < length - 4:
+                # crude P-QRS-T morphology
+                x[c - 3:c + 4] += np.array([0.05, 0.15, 0.5, 1.0, 0.5, 0.15, 0.05])
+
+        x += 0.01 * np.random.randn(length)
+        batch.append(x.astype(np.float32))
+
+    return np.stack(batch, axis=0)
+
+
+def main():
+    # Replace this with your ECG data of shape (N, T)
+    ecg_signals = create_synthetic_ecg_batch(n_samples=5, length=3000, fs=100.0)
+
+    # Example 1: Apply one random transformation
+    x = ecg_signals[0]
+    transformation_name = sample_random_transformation(include_original=False)
+    y, params = apply_transformation(x, transformation_name)
+
+    print("Random transformation example")
+    print("Transformation:", transformation_name)
+    print("Parameters:", params)
+    print("Input shape:", x.shape)
+    print("Output shape:", y.shape)
+
+    # Example 2: Plot all transformations for one ECG
+    plot_transformations(x, fs=100.0, include_original=True)
+
+    # Example 3: Create self-supervised dataset
+    dataset = ECGTransformationDataset(
+        ecg_signals=ecg_signals,
+        include_original_class=False,
+        return_original=True,
+    )
+
+    original, transformed, label, metadata = dataset[0]
+    print("\nDataset sample")
+    print("Original tensor shape:", original.shape)
+    print("Transformed tensor shape:", transformed.shape)
+    print("Label:", label.item())
+    print("Transformation name:", metadata["transformation_name"])
+    print("Parameters:", metadata["params"])
+
+
+if __name__ == "__main__":
+    main()
