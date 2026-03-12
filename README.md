@@ -37,15 +37,16 @@ Run `self_supervised_transformation.py` to make self-supervised ECG transformati
 ### Citation
 Please cite our paper below when using or referring to our work.
 ```
-@ARTICLE{10.3389/fphys.2026.1694995,
-        AUTHOR={Yalcin, Murat  and Latoschik, Marc Erich},
-        TITLE={End-to-end non-invasive ECG signal generation from PPG signal: a self-supervised learning approach},
-        JOURNAL={Frontiers in Physiology},
-        VOLUME={Volume 17 - 2026},
-        YEAR={2026},
-        URL={https://www.frontiersin.org/journals/physiology/articles/10.3389/fphys.2026.1694995},
-        DOI={10.3389/fphys.2026.1694995},
-        ISSN={1664-042X}
-        }
+@article{yalcin_end_to_end_2026,
+	author = {Yalcin, Murat and Latoschik, Marc Erich},
+	year = {2026},
+	month = {02},
+	title = {End-to-end non-invasive ECG signal generation from PPG signal: a self-supervised learning approach},
+	volume = {17},
+	journal = {Frontiers in Physiology},
+	url   = {https://www.frontiersin.org/journals/physiology/articles/10.3389/fphys.2026.1694995},
+	issn	= {1664-042X},
+	doi = {10.3389/fphys.2026.1694995}
+}
 ```
 
